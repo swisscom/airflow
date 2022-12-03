@@ -62,6 +62,31 @@ if TYPE_CHECKING:
     from airflow.utils.context import Context
 
 
+def _task_id_to_pod_name(val: str) -> str:
+    """
+    Given a task_id, convert it to a pod name.
+    Adds a 0 if start or end char is invalid.
+    Replaces any other invalid char with `-`.
+
+    :param val: non-empty string, presumed to be a task id
+    :return valid kubernetes object name.
+    """
+    if not val:
+        raise ValueError("_task_id_to_pod_name requires non-empty string.")
+    val = val.lower()
+    if not re.match(r"[a-z0-9]", val[0]):
+        val = f"0{val}"
+    if not re.match(r"[a-z0-9]", val[-1]):
+        val = f"{val}0"
+    val = re.sub(r"[^a-z0-9\-.]", "-", val)
+    if len(val) > 253:
+        raise ValueError(
+            f"Pod name {val} is longer than 253 characters. "
+            "See https://kubernetes.io/docs/concepts/overview/working-with-objects/names/."
+        )
+    return val
+
+
 class PodReattachFailure(AirflowException):
     """When we expect to be able to find a pod but cannot."""
 
@@ -112,12 +137,10 @@ class KubernetesPodOperator(BaseOperator):
     :param annotations: non-identifying metadata you can attach to the Pod.
         Can be a large range of data, and can include characters
         that are not permitted by labels.
-    :param container_resources: resources for the launched pod.
+    :param container_resources: resources for the launched pod. (templated)
     :param affinity: affinity scheduling rules for the launched pod.
     :param config_file: The path to the Kubernetes config file. (templated)
         If not specified, default value is ``~/.kube/config``
-    :param node_selectors: (Deprecated) A dict containing a group of scheduling rules.
-        Please use node_selector instead.
     :param node_selector: A dict containing a group of scheduling rules.
     :param image_pull_secrets: Any image pull secrets to be given to the pod.
         If more than one secret is required, provide a
@@ -162,6 +185,7 @@ class KubernetesPodOperator(BaseOperator):
         "config_file",
         "pod_template_file",
         "namespace",
+        "container_resources",
     )
     template_fields_renderers = {"env_vars": "py"}
 
@@ -192,7 +216,6 @@ class KubernetesPodOperator(BaseOperator):
         container_resources: k8s.V1ResourceRequirements | None = None,
         affinity: k8s.V1Affinity | None = None,
         config_file: str | None = None,
-        node_selectors: dict | None = None,
         node_selector: dict | None = None,
         image_pull_secrets: list[k8s.V1LocalObjectReference] | None = None,
         service_account_name: str | None = None,
@@ -221,7 +244,13 @@ class KubernetesPodOperator(BaseOperator):
                 "Specifying resources for the launched pod with 'resources' is deprecated. "
                 "Use 'container_resources' instead."
             )
-
+        # TODO: remove in provider 6.0.0 release. This is a mitigate step to advise users to switch to the
+        # node_selector parameter.
+        if "node_selectors" in kwargs:
+            raise ValueError(
+                "Param `node_selectors` supplied. This param is no longer supported. "
+                "Use `node_selector` instead."
+            )
         super().__init__(**kwargs)
         self.kubernetes_conn_id = kubernetes_conn_id
         self.do_xcom_push = do_xcom_push
@@ -246,16 +275,7 @@ class KubernetesPodOperator(BaseOperator):
         self.reattach_on_restart = reattach_on_restart
         self.get_logs = get_logs
         self.image_pull_policy = image_pull_policy
-        if node_selectors:
-            # Node selectors is incorrect based on k8s API
-            warnings.warn(
-                "node_selectors is deprecated. Please use node_selector instead.", DeprecationWarning
-            )
-            self.node_selector = node_selectors
-        elif node_selector:
-            self.node_selector = node_selector
-        else:
-            self.node_selector = {}
+        self.node_selector = node_selector or {}
         self.annotations = annotations or {}
         self.affinity = convert_affinity(affinity) if affinity else {}
         self.container_resources = container_resources
@@ -299,6 +319,11 @@ class KubernetesPodOperator(BaseOperator):
         if id(content) not in seen_oids and isinstance(content, k8s.V1EnvVar):
             seen_oids.add(id(content))
             self._do_render_template_fields(content, ("value", "name"), context, jinja_env, seen_oids)
+            return
+
+        if id(content) not in seen_oids and isinstance(content, k8s.V1ResourceRequirements):
+            seen_oids.add(id(content))
+            self._do_render_template_fields(content, ("limits", "requests"), context, jinja_env, seen_oids)
             return
 
         super()._render_nested_template_fields(content, context, jinja_env, seen_oids)
@@ -395,8 +420,7 @@ class KubernetesPodOperator(BaseOperator):
             self.pod_manager.await_pod_start(pod=pod, startup_timeout=self.startup_timeout_seconds)
         except PodLaunchFailedException:
             if self.log_events_on_failure:
-                for event in self.pod_manager.read_pod_events(pod).items:
-                    self.log.error("Pod Event: %s - %s", event.reason, event.message)
+                self._read_pod_log_events(pod, reraise=True)
             raise
 
     def extract_xcom(self, pod: k8s.V1Pod):
@@ -447,34 +471,36 @@ class KubernetesPodOperator(BaseOperator):
         if self.do_xcom_push:
             return result
 
+    def _read_pod_log_events(self, pod, *, reraise=True):
+        """Will fetch and emit events from pod"""
+        with _optionally_suppress(reraise=reraise):
+            for event in self.pod_manager.read_pod_events(pod).items:
+                self.log.error("Pod Event: %s - %s", event.reason, event.message)
+
     def cleanup(self, pod: k8s.V1Pod, remote_pod: k8s.V1Pod):
         pod_phase = remote_pod.status.phase if hasattr(remote_pod, "status") else None
-        if not self.is_delete_operator_pod:
-            with _suppress(Exception):
-                self.patch_already_checked(remote_pod)
+        if pod_phase != PodPhase.SUCCEEDED or not self.is_delete_operator_pod:
+            self.patch_already_checked(remote_pod, reraise=False)
         if pod_phase != PodPhase.SUCCEEDED:
             if self.log_events_on_failure:
-                with _suppress(Exception):
-                    for event in self.pod_manager.read_pod_events(pod).items:
-                        self.log.error("Pod Event: %s - %s", event.reason, event.message)
-            with _suppress(Exception):
-                self.process_pod_deletion(remote_pod)
+                self._read_pod_log_events(pod, reraise=False)
+            self.process_pod_deletion(remote_pod, reraise=False)
             error_message = get_container_termination_message(remote_pod, self.BASE_CONTAINER_NAME)
-            error_message = "\n" + error_message if error_message else ""
             raise AirflowException(
-                f"Pod {pod and pod.metadata.name} returned a failure:{error_message}\n{remote_pod}"
+                f"Pod {pod and pod.metadata.name} returned a failure:\n{error_message}\n"
+                f"remote_pod: {remote_pod}"
             )
         else:
-            with _suppress(Exception):
-                self.process_pod_deletion(remote_pod)
+            self.process_pod_deletion(remote_pod, reraise=False)
 
-    def process_pod_deletion(self, pod: k8s.V1Pod):
-        if pod is not None:
-            if self.is_delete_operator_pod:
-                self.log.info("Deleting pod: %s", pod.metadata.name)
-                self.pod_manager.delete_pod(pod)
-            else:
-                self.log.info("skipping deleting pod: %s", pod.metadata.name)
+    def process_pod_deletion(self, pod: k8s.V1Pod, *, reraise=True):
+        with _optionally_suppress(reraise=reraise):
+            if pod is not None:
+                if self.is_delete_operator_pod:
+                    self.log.info("Deleting pod: %s", pod.metadata.name)
+                    self.pod_manager.delete_pod(pod)
+                else:
+                    self.log.info("skipping deleting pod: %s", pod.metadata.name)
 
     def _build_find_pod_label_selector(self, context: Context | None = None, *, exclude_checked=True) -> str:
         labels = self._get_ti_pod_labels(context, include_try_number=False)
@@ -492,11 +518,12 @@ class KubernetesPodOperator(BaseOperator):
             return re.sub(r"[^a-z0-9-]+", "-", name.lower())
         return None
 
-    def patch_already_checked(self, pod: k8s.V1Pod):
+    def patch_already_checked(self, pod: k8s.V1Pod, *, reraise=True):
         """Add an "already checked" annotation to ensure we don't reattach on retries"""
-        pod.metadata.labels[self.POD_CHECKED_KEY] = "True"
-        body = PodGenerator.serialize_pod(pod)
-        self.client.patch_namespaced_pod(pod.metadata.name, pod.metadata.namespace, body)
+        with _optionally_suppress(reraise=reraise):
+            pod.metadata.labels[self.POD_CHECKED_KEY] = "True"
+            body = PodGenerator.serialize_pod(pod)
+            self.client.patch_namespaced_pod(pod.metadata.name, pod.metadata.namespace, body)
 
     def on_kill(self) -> None:
         if self.pod:
@@ -571,13 +598,15 @@ class KubernetesPodOperator(BaseOperator):
         pod = PodGenerator.reconcile_pods(pod_template, pod)
 
         if not pod.metadata.name:
-            pod.metadata.name = self.task_id
+            pod.metadata.name = _task_id_to_pod_name(self.task_id)
 
         if self.random_name_suffix:
             pod.metadata.name = PodGenerator.make_unique_pod_id(pod.metadata.name)
 
         if not pod.metadata.namespace:
-            hook_namespace = self.hook.conn_extras.get("extra__kubernetes__namespace")
+            # todo: replace with call to `hook.get_namespace` in 6.0, when it doesn't default to `default`.
+            # if namespace not actually defined in hook, we want to check k8s if in cluster
+            hook_namespace = self.hook._get_namespace()
             pod_namespace = self.namespace or hook_namespace or self._incluster_namespace or "default"
             pod.metadata.namespace = pod_namespace
 
@@ -586,7 +615,9 @@ class KubernetesPodOperator(BaseOperator):
             pod = secret.attach_to_pod(pod)
         if self.do_xcom_push:
             self.log.debug("Adding xcom sidecar to task %s", self.task_id)
-            pod = xcom_sidecar.add_xcom_sidecar(pod)
+            pod = xcom_sidecar.add_xcom_sidecar(
+                pod, sidecar_container_image=self.hook.get_xcom_sidecar_container_image()
+            )
 
         labels = self._get_ti_pod_labels(context)
         self.log.info("Building pod %s with labels: %s", pod.metadata.name, labels)
@@ -614,26 +645,37 @@ class KubernetesPodOperator(BaseOperator):
         print(yaml.dump(prune_dict(pod.to_dict(), mode="strict")))
 
 
-class _suppress(AbstractContextManager):
+class _optionally_suppress(AbstractContextManager):
     """
-    This behaves the same as ``contextlib.suppress`` but logs the suppressed
-    exceptions as errors with traceback.
+    Returns context manager that will swallow and log exceptions.
 
-    The caught exception is also stored on the context manager instance under
-    attribute ``exception``.
+    By default swallows descendents of Exception, but you can provide other classes through
+    the vararg ``exceptions``.
+
+    Suppression behavior can be disabled with reraise=True.
+
+    :meta private:
     """
 
-    def __init__(self, *exceptions):
-        self._exceptions = exceptions
+    def __init__(self, *exceptions, reraise=False):
+        self._exceptions = exceptions or (Exception,)
+        self.reraise = reraise
         self.exception = None
 
     def __enter__(self):
         return self
 
     def __exit__(self, exctype, excinst, exctb):
-        caught_error = exctype is not None and issubclass(exctype, self._exceptions)
-        if caught_error:
+        error = exctype is not None
+        matching_error = error and issubclass(exctype, self._exceptions)
+        if error and not matching_error:
+            return False
+        elif matching_error and self.reraise:
+            return False
+        elif matching_error:
             self.exception = excinst
             logger = logging.getLogger(__name__)
-            logger.error(str(excinst), exc_info=True)
-        return caught_error
+            logger.exception(excinst)
+            return True
+        else:
+            return True
